@@ -1,0 +1,243 @@
+using Newtonsoft.Json;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using System.Windows.Forms;
+
+namespace PopSentry
+{
+    internal static class Program
+    {
+        // WinAPI
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+
+        [DllImport("user32.dll")]
+        private static extern int GetWindowTextLength(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+        private const uint WM_CLOSE = 0x0010;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RECT
+        {
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
+        }
+
+        // 設定
+        class Settings
+        {
+            public List<string> WhiteList { get; set; } = new List<string>();
+            public List<string> BlackList { get; set; } = new List<string>();
+        }
+
+        private static Settings settings = new Settings();
+        private const string SettingsFile = "popsentry.json";
+        private const string LogFile = "popsentry.log";
+
+        [STAThread]
+        static void Main()
+        {
+            bool createdNew;
+            using (var mutex = new System.Threading.Mutex(true, "PopSentryMutex", out createdNew))
+            {
+                if (!createdNew)
+                {
+                    MessageBox.Show(
+                        "PopSentry はすでに起動しています。",
+                        "PopSentry",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information
+                    );
+                    return;
+                }
+
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+
+                LoadSettings();
+
+                // トレイアイコン
+                NotifyIcon icon = new NotifyIcon();
+                icon.Icon = SystemIcons.Information;
+                icon.Visible = true;
+                icon.Text = "PopSentry - 稼働中";
+
+                ContextMenuStrip menu = new ContextMenuStrip();
+                menu.Items.Add("ログを開く", null, (s, e) =>
+                {
+                    if (File.Exists(LogFile))
+                        Process.Start("notepad.exe", LogFile);
+                });
+                menu.Items.Add("終了", null, (s, e) =>
+                {
+                    icon.Visible = false;
+                    Application.Exit();
+                });
+                icon.ContextMenuStrip = menu;
+
+                // 監視スレッド
+                Thread t = new Thread(RunLoop);
+                t.IsBackground = true;
+                t.Start();
+
+                Application.Run();
+            }
+        }
+
+        private static void RunLoop()
+        {
+            while (true)
+            {
+                EnumWindows(EnumWindowCallback, IntPtr.Zero);
+                Thread.Sleep(300);
+            }
+        }
+
+        private static bool EnumWindowCallback(IntPtr hWnd, IntPtr lParam)
+        {
+            if (!IsWindowVisible(hWnd))
+                return true;
+
+            int length = GetWindowTextLength(hWnd);
+            if (length == 0)
+                return true;
+
+            StringBuilder sb = new StringBuilder(length + 1);
+            GetWindowText(hWnd, sb, sb.Capacity);
+            string title = sb.ToString();
+
+            if (!GetWindowRect(hWnd, out RECT rect))
+                return true;
+
+            var screen = Screen.PrimaryScreen.WorkingArea;
+
+            bool isRightBottom =
+                rect.Left > screen.Right - 800 &&
+                rect.Top > screen.Bottom - 800;
+
+            if (!isRightBottom)
+                return true;
+
+            GetWindowThreadProcessId(hWnd, out uint pid);
+            string procName = "unknown";
+
+            try
+            {
+                using (var p = Process.GetProcessById((int)pid))
+                    procName = p.ProcessName;
+            }
+            catch { }
+
+            // ホワイト → 毎回ログしてスルー
+            if (settings.WhiteList.Contains(procName))
+            {
+                LogWhite(procName, title);
+                return true;
+            }
+
+            // ブラック → 毎回ログして即死
+            if (settings.BlackList.Contains(procName))
+            {
+                LogKill(procName, title);
+                SendMessage(hWnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+                return true;
+            }
+
+            // 未登録 → ユーザーに聞く
+            DialogResult result = MessageBox.Show(
+                $"このポップアップを許可しますか？\n\nプロセス: {procName}\nタイトル: {title}",
+                "PopSentry",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question);
+
+            if (result == DialogResult.Yes)
+            {
+                settings.WhiteList.Add(procName);
+                SaveSettings();
+                LogWhite(procName, title);   // 初回ログ
+            }
+            else
+            {
+                settings.BlackList.Add(procName);
+                SaveSettings();
+                LogKill(procName, title);    // 初回ログ
+                SendMessage(hWnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+            }
+
+            return true;
+        }
+
+        private static void LoadSettings()
+        {
+            try
+            {
+                if (File.Exists(SettingsFile))
+                {
+                    string json = File.ReadAllText(SettingsFile);
+                    settings = JsonConvert.DeserializeObject<Settings>(json) ?? new Settings();
+                }
+            }
+            catch
+            {
+                settings = new Settings();
+            }
+        }
+
+        private static void SaveSettings()
+        {
+            try
+            {
+                string json = JsonConvert.SerializeObject(settings, Formatting.Indented);
+                File.WriteAllText(SettingsFile, json);
+            }
+            catch { }
+        }
+
+        // ホワイトログ（毎回）
+        private static void LogWhite(string procName, string title)
+        {
+            try
+            {
+                string line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} WHITE {procName} | {title}";
+                File.AppendAllText(LogFile, line + Environment.NewLine);
+            }
+            catch { }
+        }
+
+        // ブラックログ（毎回）
+        private static void LogKill(string procName, string title)
+        {
+            try
+            {
+                string line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} KILL {procName} | {title}";
+                File.AppendAllText(LogFile, line + Environment.NewLine);
+            }
+            catch { }
+        }
+    }
+}
